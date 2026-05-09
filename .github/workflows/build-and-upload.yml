@@ -2,43 +2,110 @@ name: Build and Upload
 
 on:
   push:
-    branches: [staging, main]
+    branches:
+      - dev
+      - prod
 
 jobs:
-  build:
-    if: github.event.repository.fork == false
+  build-and-deploy:
+    # NOTE: set to 'true' while testing on your fork, flip to 'false' before final PR to main repo
+    if: github.event.repository.fork == true
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       HOST: ${{ secrets.HOST }}
       USERNAME: ${{ secrets.USERNAME }}
       PASSWORD: ${{ secrets.PASSWORD }}
 
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Set up Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: "23"
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Install pnpm
-      uses: pnpm/action-setup@v4
-      with:
-        version: 10
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "23"
 
-    - name: Install dependencies
-      run: pnpm install
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
 
-    - name: Build Next.js application
-      run: pnpm build
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
-    - name: Archive production artifacts
-      run: tar -czf boilerplate.tar.gz .next
+      - name: Build Next.js application
+        run: pnpm build
+        env:
+          NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
 
-    - name: Copy Artifacts to server
-      run: |
-        sshpass -p "$PASSWORD" scp -o StrictHostKeyChecking=no boilerplate.tar.gz "$USERNAME@$HOST:~/build-artifacts"
-        
-    - name: Delete zip file
-      run: rm -f boilerplate.tar.gz
+      - name: Archive production artifacts
+        run: tar -czf boilerplate.tar.gz .next public package.json pnpm-lock.yaml next.config.*
+
+      - name: Determine target environment
+        id: env
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/dev" ]; then
+            echo "APP_DIR=/flowbrand/staging/frontend" >> $GITHUB_OUTPUT
+            echo "PM2_NAME=flowbrand-fe-staging" >> $GITHUB_OUTPUT
+            echo "PORT=3001" >> $GITHUB_OUTPUT
+            echo "ENV_LABEL=staging" >> $GITHUB_OUTPUT
+          else
+            echo "APP_DIR=/flowbrand/production/frontend" >> $GITHUB_OUTPUT
+            echo "PM2_NAME=flowbrand-fe-prod" >> $GITHUB_OUTPUT
+            echo "PORT=3000" >> $GITHUB_OUTPUT
+            echo "ENV_LABEL=production" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Copy artifacts to server
+        run: |
+          sshpass -p "$PASSWORD" scp -o StrictHostKeyChecking=no \
+            boilerplate.tar.gz \
+            "$USERNAME@$HOST:/tmp/boilerplate.tar.gz"
+
+      - name: Deploy on server
+        run: |
+          sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no "$USERNAME@$HOST" bash << EOF
+            set -e
+
+            APP_DIR="${{ steps.env.outputs.APP_DIR }}"
+            PM2_NAME="${{ steps.env.outputs.PM2_NAME }}"
+            PORT="${{ steps.env.outputs.PORT }}"
+            ENV_LABEL="${{ steps.env.outputs.ENV_LABEL }}"
+
+            echo ">>> [\$(date)] Starting \$ENV_LABEL deployment to \$APP_DIR"
+
+            # Extract artifact into app directory
+            tar -xzf /tmp/boilerplate.tar.gz -C "\$APP_DIR"
+
+            # Install production dependencies
+            cd "\$APP_DIR"
+            pnpm install --prod --frozen-lockfile
+
+            # Restart or start PM2 process
+            if pm2 describe "\$PM2_NAME" > /dev/null 2>&1; then
+              pm2 restart "\$PM2_NAME"
+            else
+              pm2 start "pnpm start -- --port \$PORT" --name "\$PM2_NAME"
+            fi
+
+            pm2 save
+
+            # Cleanup
+            rm -f /tmp/boilerplate.tar.gz
+
+            echo ">>> [\$(date)] Deployment complete: \$PM2_NAME running on port \$PORT"
+          EOF
+
+      - name: Delete local archive
+        if: always()
+        run: rm -f boilerplate.tar.gz
+
+      - name: Notify deployment status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "Deployment to ${{ steps.env.outputs.ENV_LABEL }} succeeded on $(date)"
+          else
+            echo "Deployment to ${{ steps.env.outputs.ENV_LABEL }} FAILED on $(date)"
+          fi
